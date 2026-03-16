@@ -135,7 +135,9 @@ graph TB
 
     subgraph Ingestion_Pipeline["Ingestion Pipeline"]
         PP["PPT Parser — MarkItDown"]
+        PREPROC["Boilerplate Stripper"]
         CH["Chunker — Hybrid Hierarchical"]
+        SUMCHUNK["Document Summary Chunk — LLM"]
         EMB["Embedding Service — Azure OpenAI"]
     end
 
@@ -143,10 +145,12 @@ graph TB
         AZS[("Azure AI Search — Value Stream Index")]
         CDB[("ChromaDB — Historical PPT Index")]
         SDB[("SQLite — Metadata DB")]
+        FB[("Feedback Store — SQLite")]
         FS["Local File Store — Uploads"]
     end
 
     subgraph Retrieval_Ranking["Retrieval and Ranking"]
+        QE["LLM Query Expansion — GPT-4o"]
         HYB["Hybrid Retriever"]
         RNK["Value Stream Ranker"]
         SYN["LLM Synthesiser — GPT-4o"]
@@ -161,14 +165,16 @@ graph TB
     FA --> RR --> RG
     FA --> IR --> IG
 
-    IG --> PP --> CH --> EMB
+    IG --> PP --> PREPROC --> CH --> SUMCHUNK --> EMB
     EMB -->|"Upsert chunks and metadata"| CDB
     EMB -->|"Persist records"| SDB
 
     RG --> PP
+    RG --> PREPROC
     RG --> CH
+    RG --> SUMCHUNK
     RG --> EMB
-    RG --> HYB
+    RG --> QE --> HYB
 
     HYB -->|"Hybrid search"| AZS
     HYB -->|"Vector search"| CDB
@@ -176,8 +182,11 @@ graph TB
 
     SYN -->|"Recommendation"| FA
     FA -->|"Response"| U
+    U -->|"Accept / Reject feedback"| FB
+    FB -->|"Weight tuning signal"| RNK
 
     SDB --> EVL --> DASH
+    FB --> EVL
 ```
 
 ### Component Responsibilities
@@ -187,14 +196,17 @@ graph TB
 | **FastAPI** | HTTP layer, file upload handling, request/response validation |
 | **LangGraph** | Stateful workflow orchestration, retry logic, conditional routing |
 | **PPTParser** | MarkItDown-based PPTX → per-slide structured data |
-| **PPTChunker** | Convert slides to atomic Chunk objects |
+| **BoilerplateStripper** | Remove slide numbers, copyright footers, and template placeholders before chunking |
+| **PPTChunker** | Convert slides to atomic Chunk objects; includes a document-level LLM summary chunk |
 | **EmbeddingService** | Azure OpenAI / OpenAI text-embedding-3-large API wrapper |
 | **AzureValueStreamSearcher** | Read-only hybrid/semantic search against VS index |
 | **ChromaVectorStore** | Local vector store for historical PPT chunks |
+| **LLMQueryExpander** | GPT-4o pre-retrieval node: reads parsed slides and emits a structured query (domain, problem type, expected outcomes) |
 | **HybridRetriever** | Orchestrates multi-source retrieval, aggregates embeddings |
-| **ValueStreamRanker** | Weighted scoring across VS sim + historical + stage signals |
+| **ValueStreamRanker** | Weighted scoring across VS sim + historical boost (with decay) + stage signals + diversity penalty |
 | **SynthesisNodes** | GPT-4o for PPT summarisation and recommendation reasoning |
 | **SQLite / ORM** | Audit trail, ingestion job tracking, evaluation ground truth |
+| **FeedbackStore** | Persists accept/reject signals per recommendation; drives weight-tuning and historical index quality review |
 
 ### Single-Index vs Multi-Index Decision
 
@@ -315,16 +327,47 @@ This chain allows every recommendation to be fully explained and audited.
 
 ```mermaid
 graph TD
-    SLIDE[Slide]
-    SLIDE --> T[Title Chunk\nChunkType.SLIDE_TITLE]
-    SLIDE --> B[Body Text Sub-chunks\nChunkType.SLIDE_TEXT\none per paragraph group]
-    SLIDE --> TB[Table Chunks\nChunkType.SLIDE_TABLE\none per table, atomic]
-    SLIDE --> N[Speaker Notes Chunk\nChunkType.SLIDE_NOTES\nif present]
+    RAW["Raw PPTX"] --> STRIP["Boilerplate Stripper"]
+    STRIP --> SLIDE["Cleaned Slide"]
 
-    B --> E1[Enriched: Section + Title + Content]
-    TB --> E2[Enriched: Section + Title + Plaintext]
-    N --> E3[Enriched: Section + Title + Notes]
+    SLIDE --> T["Title Chunk — SLIDE_TITLE"]
+    SLIDE --> B["Body Text Sub-chunks — SLIDE_TEXT — one per paragraph group"]
+    SLIDE --> TB["Table Chunks — SLIDE_TABLE — one per table, atomic"]
+    SLIDE --> N["Speaker Notes Chunk — SLIDE_NOTES — if present"]
+
+    B --> E1["Enriched: Section + Title + Content"]
+    TB --> E2["Enriched: Section + Title + Plaintext"]
+    N --> E3["Enriched: Section + Title + Notes"]
+
+    ALL_SLIDES["All Cleaned Slides"] --> SUMCHUNK["Document Summary Chunk — LLM-generated — ChunkType.DOC_SUMMARY"]
+    SUMCHUNK --> E4["Enriched: doc-level narrative — Problem → Solution → Impact arc"]
 ```
+
+#### Preprocessing: Boilerplate Stripping
+
+Before chunking, a `BoilerplateStripper` pass removes content that degrades embedding quality:
+
+- Slide numbers and page footers (regex: `^\d+$`, `Page \d+ of \d+`)
+- Copyright lines (regex: `©`, `All rights reserved`, `Confidential`)
+- Template placeholders (`Click to add text`, `[Title]`, `[Subtitle]`)
+- Repeated masthead / logo text that appears on every slide
+
+This is especially important for corporate deck templates where 30–40% of tokens on a slide can be boilerplate.
+
+#### Document-Level Summary Chunk
+
+After per-slide chunking, one additional **`DOC_SUMMARY`** chunk is generated per document using an LLM call:
+
+```
+Prompt: "Summarise this idea card in 3–5 sentences. Identify the core problem,
+the proposed solution, the expected business outcome, and the domain/function.
+Output plain prose."
+```
+
+This chunk:
+- Captures the **Problem → Solution → Impact narrative arc** that per-slide chunks lose.
+- Serves as a **high-recall anchor**: when individual slide chunks score poorly, the summary chunk often provides a stronger semantic match against the VS descriptions.
+- Is stored with `chunk_type = DOC_SUMMARY` and always included as an additional query vector.
 
 #### Why Hierarchical?
 
@@ -332,6 +375,7 @@ graph TD
 2. **Title context injection.** Every sub-chunk has its parent slide's title prepended in `enriched_content`. This prevents the "orphan paragraph" problem where a retrieved chunk is incomprehensible without context.
 3. **Granular retrieval.** Small text sub-chunks match precise concept-level queries; table chunks match numerical/structured queries; title chunks catch high-level topic queries.
 4. **Section labels.** Heuristic section annotation (Problem, Solution, Metrics, etc.) enables metadata-filtered retrieval at inference time.
+5. **Document summary chunk.** One LLM-generated summary per document captures cross-slide narrative that fine-grained chunks miss.
 
 #### Token Budget
 
@@ -341,6 +385,7 @@ graph TD
 | SLIDE_TEXT | 512 | Paragraph-grouped; overlapping windows if long |
 | SLIDE_TABLE | 512 | Truncated if needed; headers always included |
 | SLIDE_NOTES | 256 | Half budget; notes are supplementary |
+| DOC_SUMMARY | 384 | LLM-generated per document; captures cross-slide narrative |
 
 #### Enriched Content Format
 
@@ -428,8 +473,9 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    Q["Uploaded PPT Chunks"]
-    Q --> AGG["Mean-pool embeddings — Build keyword query text"]
+    Q["Uploaded PPT Chunks + Doc Summary"]
+    Q --> QE["LLM Query Expansion — GPT-4o — domain + problem type + outcomes"]
+    QE --> AGG["Mean-pool embeddings — Build structured query text"]
 
     subgraph Source1["Source 1 — Azure AI Search"]
         AGG --> HYB["Hybrid Search — BM25 + Vector + RRF"]
@@ -442,11 +488,11 @@ graph LR
         PER_CHUNK --> HIST_HITS["Historical PPT chunks with mapped VS IDs"]
     end
 
-    VS_CAND --> RANK["Weighted Scorer"]
-    HIST_HITS --> HIST_BOOST["Historical Boost — computed per VS"]
+    VS_CAND --> RANK["Weighted Scorer + Diversity Penalty"]
+    HIST_HITS --> HIST_BOOST["Historical Boost — time-decayed — computed per VS"]
     HIST_BOOST --> RANK
 
-    VS_CAND --> STAGE["Stage Keyword Overlap Score"]
+    VS_CAND --> STAGE["Stage Soft Match — embedding similarity vs stage descriptions"]
     STAGE --> RANK
 
     RANK --> TOP_N["Top-N Ranked Value Streams"]
@@ -454,26 +500,86 @@ graph LR
     LLM --> REC["Recommendation Result"]
 ```
 
+### Pre-Retrieval: LLM Query Expansion
+
+Before retrieval, a **`query_expand` node** reads the parsed slides and doc summary and asks GPT-4o to produce a structured query:
+
+```
+Prompt: "Given the following idea card content, identify:
+1. The primary business domain (e.g. Supply Chain, Finance, HR)
+2. The core problem type (e.g. process automation, cost reduction, compliance)
+3. The expected business outcomes (e.g. 20% FTE reduction, SLA improvement)
+4. Any explicit Value Stream or capability keywords mentioned.
+Output as JSON."
+```
+
+This structured output replaces or augments raw slide text as the retrieval query, giving both the BM25 and vector retrievers much higher-quality input than mean-pooled noise-heavy slide embeddings.
+
 ### Evidence Combination
 
 | Signal | Weight | Description |
 |--------|--------|-------------|
 | `vs_similarity_score` | 0.40 | Azure AI Search hybrid score for direct VS match |
-| `historical_boost_score` | 0.35 | Average similarity of historical chunks referencing this VS |
+| `historical_boost_score` | 0.35 | Time-decayed similarity of historical chunks referencing this VS |
 | `rerank_score` | 0.15 | Azure semantic ranker or cross-encoder score |
-| `stage_match_score` | 0.10 | Keyword overlap between VS stages and PPT content |
+| `stage_match_score` | 0.10 | **Soft match**: embedding similarity between PPT content and VS stage descriptions |
 
-**Weights are configurable** in `RankingConfig`. During evaluation, these should be tuned against the ground-truth dataset.
+**Weights are configurable** in `RankingConfig` and are candidates for learned optimisation once feedback data is available (see Decision 5 and Section 17).
 
 ### Historical Boost Calculation
 
 ```python
-boost[vs_id] = min(1.0, (mean_similarity) * (1 + 0.1 * log(hit_count + 1)))
+# Time-decay factor: recent mappings weighted higher
+DECAY_HALFLIFE_DAYS = 180
+decay = 0.5 ** ((now - mapping.created_at).days / DECAY_HALFLIFE_DAYS)
+
+boost[vs_id] = min(1.0, (mean_similarity * decay) * (1 + 0.1 * log(hit_count + 1)))
 ```
 
 This formula rewards:
 - High average semantic similarity between the uploaded PPT and historical cards mapped to this VS.
 - Consensus: if many historical cards agree (high `hit_count`), the boost increases logarithmically.
+- **Recency:** mappings older than ~6 months decay toward zero, preventing the system from entrenching early biases or over-rewarding historically popular Value Streams.
+
+### Stage Soft Matching
+
+Instead of lexical keyword overlap, stage matching now uses **embedding similarity**:
+
+```python
+stage_match_score[vs_id] = cosine_similarity(
+    mean(chunk_embeddings),
+    mean(embed(stage.description) for stage in vs.stages)
+)
+```
+
+This avoids false positives from domain-ambiguous terms (e.g. "Discovery" in pharma vs. software contexts) and false negatives from synonym variation. VS stage descriptions are pre-embedded and cached at startup.
+
+### Diversity Penalty
+
+To prevent the ranked list collapsing onto 5–6 dominant Value Streams:
+
+```python
+# Penalise VS if a closely related VS is already ranked above it
+diversity_penalty[vs_id] = max(
+    cosine_similarity(embed(vs), embed(already_ranked_vs))
+    for already_ranked_vs in ranked_above
+)
+final_score[vs_id] = raw_score[vs_id] * (1 - 0.3 * diversity_penalty[vs_id])
+```
+
+The penalty factor (0.3) is configurable in `RankingConfig`. This ensures the long tail of ~50 Value Streams is surfaced when relevant.
+
+### Confidence Thresholding
+
+The `confidence_score` returned in the API response is calibrated, not just a rescaled similarity:
+
+| Confidence Tier | Score Range | Response behaviour |
+|----------------|-------------|-------------------|
+| **High** | ≥ 0.75 | Return top recommendation with full reasoning |
+| **Medium** | 0.50 – 0.74 | Return top 3 with a caveat note |
+| **Low** | < 0.50 | Return `"no_strong_match"` signal; still provide best-effort candidates |
+
+This prevents users from over-trusting marginal results.
 
 ---
 
@@ -484,8 +590,10 @@ This formula rewards:
 ```mermaid
 stateDiagram-v2
     [*] --> parse
-    parse --> chunk : success
+    parse --> preprocess : success
     parse --> error : ParseError
+
+    preprocess --> chunk : success
 
     chunk --> embed : success
     chunk --> error : ChunkError
@@ -493,7 +601,9 @@ stateDiagram-v2
     embed --> summarise : success
     embed --> error : EmbedError
 
-    summarise --> retrieve : always
+    summarise --> query_expand : always
+    query_expand --> retrieve : always
+
     retrieve --> rank : success
     retrieve --> error : RetrievalError
 
@@ -522,6 +632,7 @@ class RecommendationState(TypedDict, total=False):
 
     # Query synthesis
     query_summary: str
+    expanded_query: ExpandedQuery  # LLM-structured: domain, problem_type, outcomes, keywords
 
     # Retrieval
     retrieval_context: RetrievalContext
@@ -544,13 +655,15 @@ class RecommendationState(TypedDict, total=False):
 | Node | Input Keys | Output Keys | Can Fail? |
 |------|-----------|------------|----------|
 | `parse` | `file_path` | `uploaded_ppt`, `_parsed_document` | Yes → `error` |
-| `chunk` | `_parsed_document` | `query_chunks` | Yes → `error` |
+| `preprocess` | `_parsed_document` | `_cleaned_document` | Non-fatal (pass-through on failure) |
+| `chunk` | `_cleaned_document` | `query_chunks` (incl. DOC_SUMMARY) | Yes → `error` |
 | `embed` | `query_chunks` | `chunk_embeddings` | Yes → `error` |
 | `summarise` | `query_chunks` | `query_summary` | Non-fatal (empty fallback) |
-| `retrieve` | `query_chunks`, `domain_hint` | `retrieval_context` | Yes → `error` |
+| `query_expand` | `query_summary`, `query_chunks` | `expanded_query` | Non-fatal (raw summary fallback) |
+| `retrieve` | `expanded_query`, `chunk_embeddings`, `domain_hint` | `retrieval_context` | Yes → `error` |
 | `rank` | `retrieval_context` | `ranked_value_streams` | Yes → `error` |
 | `synthesise` | `ranked_value_streams`, `query_summary` | `recommendation` | Yes → `error` |
-| `persist` | `recommendation` | _(side effect: SQLite)_ | Non-fatal |
+| `persist` | `recommendation` | _(side effect: SQLite + FeedbackStore)_ | Non-fatal |
 | `error` | `errors` | _(logs, final status)_ | Terminal |
 
 ### Ingestion Workflow
@@ -975,15 +1088,16 @@ graph LR
 | **Tradeoff** | Memory usage scales with PPT size. For very large PPTs (100+ slides), batch embedding may be needed. |
 | **When to switch** | If multi-turn interaction is needed (e.g., user refines their query), persist the upload temporarily. |
 
-### Decision 5: Weighted Score Combination
+### Decision 5: Weighted Score Combination (with feedback-driven tuning path)
 
 | | Details |
 |-|---------|
-| **Chosen** | Configurable weighted sum: VS similarity + historical boost + rerank + stage match |
+| **Chosen** | Configurable weighted sum: VS similarity + historical boost (time-decayed) + rerank + stage soft-match + diversity penalty |
 | **Why** | Interpretable, tunable, and fast. Weights can be adjusted based on offline evaluation without rebuilding the pipeline. |
+| **Feedback loop** | Accept/reject signals from users are persisted in the Feedback Store. These drive periodic grid-search weight re-tuning against the ground-truth eval set. This gives most of the benefit of a learned ranker with much lower engineering cost. |
 | **Alternative** | Learn-to-rank model (LambdaMART, XGBoost ranker) |
 | **Tradeoff** | Learned ranker can find non-linear patterns that weighted sum misses. However, it requires training data (recommendation traces with human labels) and is a bigger engineering investment. |
-| **When to switch** | After accumulating >500 human-labelled recommendations, train a learn-to-rank model on top of the same feature set. |
+| **When to switch** | After accumulating >500 human-labelled recommendations (tracked in FeedbackStore), train a learn-to-rank model on top of the same feature set. The four scoring signals become features. |
 
 ### Decision 6: LangGraph for Orchestration
 
@@ -1130,3 +1244,45 @@ logger.info(
 ### Explainability
 - Evidence chains (chunk → source document → historical VS mapping) are the most practical form of explainability for enterprise stakeholders.
 - LLM-generated reasoning adds narrative explainability but should always be grounded in evidence – the prompt explicitly references ranked candidates and their scores to prevent hallucination.
+
+---
+
+## 17. Design Review
+
+This section records architectural review feedback and the resolution applied to each point.
+
+### 17.1 Chunking Layer
+
+| Concern | Resolution | Where Applied |
+|---------|-----------|--------------|
+| Boilerplate (slide numbers, footers, template placeholders) pollutes embeddings | Added `BoilerplateStripper` preprocessing pass before chunking | Section 5, system diagram |
+| Per-slide chunks lose the Problem → Solution → Impact narrative arc | Added `DOC_SUMMARY` chunk type: one LLM-generated summary per document serves as a high-recall anchor in retrieval | Section 5, token budget table, system diagram |
+
+### 17.2 Retrieval and Scoring
+
+| Concern | Resolution | Where Applied |
+|---------|-----------|--------------|
+| Static weights will drift as the catalogue evolves | Weights remain configurable; accept/reject signals from users feed into periodic grid-search re-tuning against the eval set. Path to full learn-to-rank is documented once >500 labelled traces exist. | Decision 5, Section 7 evidence combination |
+| Stage-level keyword overlap is brittle on domain-ambiguous terms | Replaced lexical overlap with **embedding similarity** between PPT content and pre-embedded VS stage descriptions | Section 7 stage soft matching |
+| Raw slide text is noisy input to retrievers | Added `query_expand` LangGraph node: GPT-4o reads parsed slides and produces a structured query (domain, problem type, expected outcomes, keywords) before retrieval | Section 7 pre-retrieval, Section 8 workflow |
+
+### 17.3 Historical Boost
+
+| Concern | Resolution | Where Applied |
+|---------|-----------|--------------|
+| Early wrong/biased recommendations get reinforced | Added **time-decay factor** (half-life 180 days): older mappings decay toward zero | Section 7 historical boost formula |
+| System collapses onto 5–6 dominant Value Streams | Added **diversity penalty**: penalises VS candidates that are closely related to already-ranked results | Section 7 diversity penalty |
+
+### 17.4 LLM Usage
+
+| Concern | Resolution | Where Applied |
+|---------|-----------|--------------|
+| GPT-4o only used as end-of-pipeline summariser; underutilised | Added GPT-4o as a **pre-retrieval query expander** (`query_expand` node): structured JSON output used as retrieval input | Section 7, Section 8 |
+
+### 17.5 Missing Pieces — Accepted
+
+| Gap | Resolution | Where Applied |
+|-----|-----------|--------------|
+| No feedback loop | Added `FeedbackStore` (SQLite table for accept/reject signals per recommendation); wired to ranker weight tuning and evaluation pipeline | System diagram, Decision 5 |
+| Confidence score not calibrated | Replaced raw similarity rescaling with a **three-tier confidence threshold** (High ≥ 0.75 / Medium 0.50–0.74 / Low < 0.50); Low tier returns a `"no_strong_match"` signal | Section 7 confidence thresholding |
+| No handling of multi-stream ideas | **Deferred to v2.** The confidence tiering and top-3 return on medium confidence partially addresses this. A clustering step on top-K results is the recommended next step after basic feedback loop is in place. | Noted; not yet implemented |
