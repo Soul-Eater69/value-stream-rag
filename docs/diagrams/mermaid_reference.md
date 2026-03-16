@@ -10,24 +10,24 @@ in `ARCHITECTURE.md`. Below is a standalone reference with each diagram labelled
 ```mermaid
 graph TB
     subgraph Client
-        U[User / Portal]
+        U["User / Portal"]
     end
-    subgraph API Layer
-        FA[FastAPI App]
+    subgraph API_Layer["API Layer"]
+        FA["FastAPI App"]
     end
     subgraph Orchestration
-        IG[Ingestion Graph]
-        RG[Recommendation Graph]
+        IG["Ingestion Graph"]
+        RG["Recommendation Graph"]
     end
     subgraph Storage
-        AZS[(Azure AI Search\nValue Stream Index)]
-        CDB[(ChromaDB\nHistorical PPT Index)]
-        SDB[(SQLite Metadata DB)]
+        AZS[("Azure AI Search — Value Stream Index")]
+        CDB[("ChromaDB — Historical PPT Index")]
+        SDB[("SQLite Metadata DB")]
     end
     subgraph Retrieval
-        HYB[Hybrid Retriever]
-        RNK[Ranker]
-        SYN[LLM Synthesiser]
+        HYB["Hybrid Retriever"]
+        RNK["Ranker"]
+        SYN["LLM Synthesiser"]
     end
 
     U --> FA

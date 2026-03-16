@@ -119,63 +119,63 @@ Enterprise idea-card PPTs must be manually triaged and mapped to Value Streams �
 ```mermaid
 graph TB
     subgraph Client
-        U[User / Portal]
+        U["User / Portal"]
     end
 
-    subgraph API Layer
-        FA[FastAPI App]
-        RR[/recommendations/upload]
-        IR[/ingestion/historical/batch]
+    subgraph API_Layer["API Layer"]
+        FA["FastAPI App"]
+        RR["POST /recommendations/upload"]
+        IR["POST /ingestion/historical/batch"]
     end
 
-    subgraph Orchestration - LangGraph
-        IG[Ingestion Graph]
-        RG[Recommendation Graph]
+    subgraph Orchestration_LangGraph["Orchestration — LangGraph"]
+        IG["Ingestion Graph"]
+        RG["Recommendation Graph"]
     end
 
-    subgraph Ingestion Pipeline
-        PP[PPT Parser - MarkItDown]
-        CH[Chunker - Hybrid Hierarchical]
-        EMB[Embedding Service - Azure OpenAI]
+    subgraph Ingestion_Pipeline["Ingestion Pipeline"]
+        PP["PPT Parser — MarkItDown"]
+        CH["Chunker — Hybrid Hierarchical"]
+        EMB["Embedding Service — Azure OpenAI"]
     end
 
     subgraph Storage
-        AZS[(Azure AI Search\nValue Stream Index)]
-        CDB[(ChromaDB\nHistorical PPT Index)]
-        SDB[(SQLite\nMetadata DB)]
-        FS[Local File Store\nUploads]
+        AZS[("Azure AI Search — Value Stream Index")]
+        CDB[("ChromaDB — Historical PPT Index")]
+        SDB[("SQLite — Metadata DB")]
+        FS["Local File Store — Uploads"]
     end
 
-    subgraph Retrieval & Ranking
-        HYB[Hybrid Retriever]
-        RNK[Value Stream Ranker]
-        SYN[LLM Synthesiser - GPT-4o]
+    subgraph Retrieval_Ranking["Retrieval and Ranking"]
+        HYB["Hybrid Retriever"]
+        RNK["Value Stream Ranker"]
+        SYN["LLM Synthesiser — GPT-4o"]
     end
 
     subgraph Evaluation
-        EVL[Offline Evaluator]
-        DASH[Metrics Dashboard]
+        EVL["Offline Evaluator"]
+        DASH["Metrics Dashboard"]
     end
 
-    U -->|Upload PPTX| FA
+    U -->|"Upload PPTX"| FA
     FA --> RR --> RG
     FA --> IR --> IG
 
     IG --> PP --> CH --> EMB
-    EMB -->|Upsert chunks + metadata| CDB
-    EMB -->|Persist records| SDB
+    EMB -->|"Upsert chunks and metadata"| CDB
+    EMB -->|"Persist records"| SDB
 
     RG --> PP
     RG --> CH
     RG --> EMB
     RG --> HYB
 
-    HYB -->|Hybrid search| AZS
-    HYB -->|Vector search| CDB
+    HYB -->|"Hybrid search"| AZS
+    HYB -->|"Vector search"| CDB
     HYB --> RNK --> SYN
 
-    SYN -->|Recommendation| FA
-    FA -->|Response| U
+    SYN -->|"Recommendation"| FA
+    FA -->|"Response"| U
 
     SDB --> EVL --> DASH
 ```
@@ -428,30 +428,30 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    Q[Uploaded PPT Chunks]
-    Q --> AGG[Mean-pool embeddings\nBuild keyword query text]
+    Q["Uploaded PPT Chunks"]
+    Q --> AGG["Mean-pool embeddings — Build keyword query text"]
 
-    subgraph Source 1 - Azure AI Search
-        AGG --> HYB[Hybrid Search\nBM25 + Vector + RRF]
-        HYB --> SEM[Semantic Reranking\nAzure native ranker]
-        SEM --> VS_CAND[Top-K Value Stream\nCandidates with scores]
+    subgraph Source1["Source 1 — Azure AI Search"]
+        AGG --> HYB["Hybrid Search — BM25 + Vector + RRF"]
+        HYB --> SEM["Semantic Reranking — Azure native ranker"]
+        SEM --> VS_CAND["Top-K Value Stream Candidates with scores"]
     end
 
-    subgraph Source 2 - ChromaDB
-        Q --> PER_CHUNK[Per-chunk vector search]
-        PER_CHUNK --> HIST_HITS[Historical PPT chunks\nwith mapped VS IDs]
+    subgraph Source2["Source 2 — ChromaDB"]
+        Q --> PER_CHUNK["Per-chunk vector search"]
+        PER_CHUNK --> HIST_HITS["Historical PPT chunks with mapped VS IDs"]
     end
 
-    VS_CAND --> RANK[Weighted Scorer]
-    HIST_HITS --> HIST_BOOST[Historical Boost\nComputer per VS]
+    VS_CAND --> RANK["Weighted Scorer"]
+    HIST_HITS --> HIST_BOOST["Historical Boost — computed per VS"]
     HIST_BOOST --> RANK
 
-    VS_CAND --> STAGE[Stage Keyword\nOverlap Score]
+    VS_CAND --> STAGE["Stage Keyword Overlap Score"]
     STAGE --> RANK
 
-    RANK --> TOP_N[Top-N Ranked\nValue Streams]
-    TOP_N --> LLM[GPT-4o Reasoning]
-    LLM --> REC[Recommendation Result]
+    RANK --> TOP_N["Top-N Ranked Value Streams"]
+    TOP_N --> LLM["GPT-4o Reasoning"]
+    LLM --> REC["Recommendation Result"]
 ```
 
 ### Evidence Combination
@@ -870,21 +870,21 @@ Submit human-in-the-loop feedback.
 
 ```mermaid
 graph LR
-    subgraph Azure - Managed
-        AZS[(Azure AI Search\nValue Stream Index\n~50 documents\nHybrid + Semantic)]
+    subgraph AzureManaged["Azure — Managed"]
+        AZS[("Azure AI Search — Value Stream Index — 50 docs — Hybrid + Semantic")]
     end
 
-    subgraph Local - PoC
-        CDB[(ChromaDB\nHistorical PPT Index\nCosine similarity\nPersisted to disk)]
-        SDB[(SQLite\nMetadata DB\nIdea cards, chunks,\ntraces, eval data)]
-        FS[File System\nUploads & historical\nPPTs stored locally]
+    subgraph LocalPoC["Local — PoC"]
+        CDB[("ChromaDB — Historical PPT Index — Cosine similarity — Persisted to disk")]
+        SDB[("SQLite — Metadata DB — Idea cards, chunks, traces, eval data")]
+        FS["File System — Uploads and historical PPTs"]
     end
 
-    subgraph Azure - Production Path
-        ABS[(Azure Blob Storage\nPPT files)]
-        AZSI[(Azure AI Search\nHistorical PPT Index\nProduction scale)]
-        AZPS[(Azure PostgreSQL\nProduction metadata DB)]
-        AZRC[(Azure Redis Cache\nEmbedding cache)]
+    subgraph AzureProd["Azure — Production Path"]
+        ABS[("Azure Blob Storage — PPT files")]
+        AZSI[("Azure AI Search — Historical PPT Index — Production scale")]
+        AZPS[("Azure PostgreSQL — Production metadata DB")]
+        AZRC[("Azure Redis Cache — Embedding cache")]
     end
 ```
 
