@@ -1,0 +1,29 @@
+[
+  {
+    "id": "VS001",
+    "name": "Order Management Value Stream",
+    "description": "End-to-end management of customer orders from receipt to fulfilment confirmation.",
+    "domain": "Supply Chain",
+    "keywords": ["order", "fulfilment", "dispatch", "customer", "tracking"],
+    "stages": [
+      {"id": "VS001-S1", "name": "Order Receipt", "sequence_order": 1, "keywords": ["intake", "create", "submit"]},
+      {"id": "VS001-S2", "name": "Inventory Check", "sequence_order": 2, "keywords": ["stock", "availability", "reserve"]},
+      {"id": "VS001-S3", "name": "Fulfilment", "sequence_order": 3, "keywords": ["pick", "pack", "prepare"]},
+      {"id": "VS001-S4", "name": "Dispatch", "sequence_order": 4, "keywords": ["ship", "carrier", "label"]},
+      {"id": "VS001-S5", "name": "Confirmation", "sequence_order": 5, "keywords": ["notify", "confirm", "close"]}
+    ]
+  },
+  {
+    "id": "VS007",
+    "name": "Inventory Control Value Stream",
+    "description": "Real-time tracking and management of inventory levels, reorder points, and stock audits.",
+    "domain": "Supply Chain",
+    "keywords": ["inventory", "stock", "reorder", "warehouse", "audit", "ERP"],
+    "stages": [
+      {"id": "VS007-S1", "name": "Stock Receipt", "sequence_order": 1, "keywords": ["receive", "goods-in", "inspect"]},
+      {"id": "VS007-S2", "name": "Location Assignment", "sequence_order": 2, "keywords": ["putaway", "location", "bin"]},
+      {"id": "VS007-S3", "name": "Reorder Trigger", "sequence_order": 3, "keywords": ["threshold", "reorder", "alert", "min-max"]},
+      {"id": "VS007-S4", "name": "Audit", "sequence_order": 4, "keywords": ["cycle-count", "reconcile", "discrepancy"]}
+    ]
+  }
+]
