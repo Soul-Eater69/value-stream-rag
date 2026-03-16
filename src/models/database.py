@@ -69,6 +69,11 @@ class ChunkORM(Base):
     token_count: Mapped[int] = mapped_column(Integer)
     table_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     section_label: Mapped[str] = mapped_column(String(256), default="")
+    # Versioning: tracks which embedding model produced this chunk's vector.
+    # Populated at ingest time from EmbeddingService.model_id.
+    # A mismatch between stored model_id and the live service indicates stale
+    # embeddings that must be re-ingested before similarity scores are valid.
+    embedding_model: Mapped[str] = mapped_column(String(128), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     extra_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
 

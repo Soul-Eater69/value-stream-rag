@@ -27,6 +27,42 @@
 
 ---
 
+## 0. Version Scope Lock
+
+> **Read this before touching any feature.**
+> The three capabilities below are often conflated in discussions. They are distinct products with different data requirements and evaluation criteria. Building V2 or V3 scope into V1 will delay delivery and add complexity that cannot be evaluated.
+
+### V1 — Current (PoC) — **Only this is in scope now**
+
+| Capability | Status |
+|-----------|--------|
+| Upload idea-card PPT → return top-5 Value Stream recommendations | ✅ In scope |
+| Evidence: which historical chunks support each recommendation | ✅ In scope |
+| LLM reasoning: natural-language explanation of recommendations | ✅ In scope |
+| Offline evaluation: Hit@K, MRR, NDCG against JIRA ground-truth | ✅ In scope |
+| Stage recommendation (which stage within a VS) | ❌ Out of scope |
+| VS description generation (auto-writing new VS descriptions) | ❌ Out of scope |
+| Multi-tenant / per-user VS catalogues | ❌ Out of scope |
+| Real-time feedback loop closing into ranking weights | ❌ Out of scope |
+
+### V2 — Next milestone
+
+- **Stage recommendation**: given a top-1 VS recommendation, predict the most relevant stage within that VS for the uploaded idea-card.
+- **Confidence calibration**: replace heuristic confidence score with percentile-rank from `ConfidenceCalibrator` (requires ~50 labelled feedback records).
+- **Azure semantic reranker**: wire `AzureValueStreamSearcher.semantic_rerank()` into the pipeline to populate `rerank_score` (currently falls back to cosine).
+- **Human feedback loop**: `RecommendationTraceORM.human_approved` data aggregated and fed back into offline eval.
+
+### V3 — Production hardening
+
+- **Multi-tenant**: per-tenant ChromaDB collection + VS catalogue partition; tenant resolved from JWT claim.
+- **RBAC on evidence endpoints**: evidence chunks may contain confidential slide content; restrict to upload owner.
+- **VS description generation**: LLM-assisted drafting of new VS descriptions from stage documents (separate pipeline from recommendation).
+- **Retention / deletion**: uploaded PPTX files purged after configurable TTL; GDPR right-to-erasure flow.
+- **Re-ingestion detection**: `embedding_model` version stored per chunk; mismatch between stored and live model triggers re-ingestion job.
+- **Prompt injection monitoring**: aggregate redaction events from `sanitizer.py` into a security dashboard.
+
+---
+
 ## 1. Executive Summary
 
 ### What the System Does

@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from src.graph.state import RecommendationState
 from src.models.domain import RecommendationResult, ValueStream
+from src.security.sanitizer import sanitize_slide_content
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +64,12 @@ class SynthesisNodes:
                 return {**state, "query_summary": "", "status": "summarised"}
 
             # Select most informative chunks (titles + text, skip notes/tables)
+            # Sanitise before including in LLM prompt
             content_parts = []
             for c in chunks:
                 from src.models.domain import ChunkType
                 if c.chunk_type in (ChunkType.SLIDE_TITLE, ChunkType.SLIDE_TEXT):
-                    content_parts.append(c.content)
+                    content_parts.append(sanitize_slide_content(c.content))
                 if len("\n".join(content_parts)) > 3000:
                     break
 
@@ -107,10 +109,11 @@ class SynthesisNodes:
                 reasoning = "No matching Value Streams were found for the uploaded idea card."
                 confidence = 0.0
             else:
-                # Format candidates for the LLM
+                # Format candidates for the LLM; sanitise summary too
+                safe_summary = sanitize_slide_content(summary or "No summary available.")
                 candidates_text = self._format_candidates(ranked[:5])
                 prompt = _RECOMMENDATION_PROMPT.format(
-                    summary=summary or "No summary available.",
+                    summary=safe_summary,
                     candidates=candidates_text,
                 )
                 reasoning = self._call_llm(prompt)

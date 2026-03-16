@@ -24,7 +24,12 @@ def retrieve_candidates(state: RecommendationState, retriever) -> Recommendation
         chunks = state.get("query_chunks", [])
         domain = state.get("domain_hint")
 
-        ctx = retriever.retrieve(query_chunks=chunks, domain_filter=domain)
+        long_doc_mode = state.get("long_doc_mode", False)
+        ctx = retriever.retrieve(
+            query_chunks=chunks,
+            domain_filter=domain,
+            skip_historical=long_doc_mode,
+        )
 
         logger.info(
             "Retrieved %d VS candidates | %d historical hits",

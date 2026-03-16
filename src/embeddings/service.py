@@ -47,6 +47,18 @@ class EmbeddingService(ABC):
         """Embedding vector dimension."""
         ...
 
+    @property
+    @abstractmethod
+    def model_id(self) -> str:
+        """
+        Stable identifier for this embedding model/deployment.
+
+        Stored in ChromaDB metadata and SQLite so that stale embeddings
+        produced by a different model can be detected at query time.
+        Format: "<provider>/<model-or-deployment-name>"
+        """
+        ...
+
 
 class AzureOpenAIEmbeddingService(EmbeddingService):
     """Azure OpenAI text-embedding-3-large backend."""
@@ -69,6 +81,10 @@ class AzureOpenAIEmbeddingService(EmbeddingService):
         self._deployment = deployment
         self._batch_size = batch_size
         self._dim: int | None = None
+
+    @property
+    def model_id(self) -> str:
+        return f"azure/{self._deployment}"
 
     @property
     def dimension(self) -> int:
@@ -131,6 +147,10 @@ class OpenAIEmbeddingService(EmbeddingService):
         self._dim: int | None = None
 
     @property
+    def model_id(self) -> str:
+        return f"openai/{self._model}"
+
+    @property
     def dimension(self) -> int:
         if self._dim is None:
             probe = self.embed("dimension probe")
@@ -166,6 +186,10 @@ class MockEmbeddingService(EmbeddingService):
 
     def __init__(self, dimension: int = 1536) -> None:
         self._dimension = dimension
+
+    @property
+    def model_id(self) -> str:
+        return "mock/deterministic-hash"
 
     @property
     def dimension(self) -> int:

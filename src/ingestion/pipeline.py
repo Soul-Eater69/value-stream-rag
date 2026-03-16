@@ -122,6 +122,7 @@ class IngestionPipeline:
                 chunks=chunks,
                 embeddings=embeddings,
                 mapped_value_stream_ids=record.mapped_value_stream_ids,
+                embedding_model=self._embedder.model_id,
             )
 
             # 6. Persist to SQLite
@@ -181,6 +182,7 @@ class IngestionPipeline:
                     token_count=chunk.token_count,
                     table_index=chunk.table_index,
                     section_label=chunk.section_label,
+                    embedding_model=self._embedder.model_id,
                 )
                 session.add(chunk_orm)
 

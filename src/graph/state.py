@@ -70,6 +70,12 @@ class RecommendationState(TypedDict, total=False):
     # Query synthesis
     query_summary: str  # LLM-generated summary of the uploaded PPT
 
+    # Structured query expansion (from expansion_nodes.expand_query)
+    query_expansion: dict  # {summary, keywords, domain_hint}
+
+    # Long-document gate
+    long_doc_mode: bool  # True when slide_count > LONG_DOC_SLIDE_THRESHOLD
+
     # Retrieval
     retrieval_context: RetrievalContext
 

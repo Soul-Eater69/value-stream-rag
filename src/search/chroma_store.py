@@ -65,8 +65,15 @@ class ChromaVectorStore:
         chunks: list[Chunk],
         embeddings: list[list[float]],
         mapped_value_stream_ids: list[str],
+        embedding_model: str = "",
     ) -> None:
-        """Insert or update chunk embeddings and metadata."""
+        """
+        Insert or update chunk embeddings and metadata.
+
+        embedding_model should be EmbeddingService.model_id — stored so that
+        any future model change can be detected by comparing stored vs live
+        model IDs before running similarity queries.
+        """
         import json
 
         if len(chunks) != len(embeddings):
@@ -86,6 +93,7 @@ class ChromaVectorStore:
                 "section_label": c.section_label,
                 "table_index": c.table_index if c.table_index is not None else -1,
                 "mapped_vs_ids": json.dumps(mapped_value_stream_ids),
+                "embedding_model": embedding_model,
             }
             for c in chunks
         ]
@@ -151,6 +159,7 @@ class ChromaVectorStore:
                     "section_label": meta.get("section_label", ""),
                     "table_index": meta.get("table_index", -1),
                     "mapped_vs_ids": vs_ids,
+                    "embedding_model": meta.get("embedding_model", ""),
                 }
             )
 

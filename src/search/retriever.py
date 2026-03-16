@@ -80,6 +80,7 @@ class HybridRetriever:
         self,
         query_chunks: list[Chunk],
         domain_filter: str | None = None,
+        skip_historical: bool = False,
     ) -> RetrievalContext:
         """
         Run multi-source retrieval for a list of query chunks (from uploaded PPT).
@@ -135,6 +136,14 @@ class HybridRetriever:
         logger.info("Catalogue scoring produced %d VS candidates", len(vs_candidates))
 
         # ── Step 2: Historical PPT retrieval from ChromaDB
+        # Skipped in long-doc mode: the trimmed title-only chunks are too sparse
+        # to produce useful per-chunk similarity matches.
+        if skip_historical:
+            logger.info(
+                "skip_historical=True (long-doc mode); skipping ChromaDB per-chunk search"
+            )
+            return ctx
+
         logger.info("Running vector search against historical PPT index (ChromaDB)")
         all_hist_hits: list[dict] = []
         per_chunk_k = max(1, self._top_k_hist // len(query_chunks))
