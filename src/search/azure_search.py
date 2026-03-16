@@ -167,6 +167,22 @@ class AzureValueStreamSearcher:
         )
         return [self._doc_to_value_stream(r) for r in results]
 
+    def list_all(self, max_results: int = 1000) -> list[ValueStream]:
+        """
+        Return all documents from the Value Stream index.
+
+        Used by VSCatalogue at startup to pre-load every VS into memory.
+        max_results should comfortably exceed the total VS count (~50 today).
+        """
+        results = self._client.search(
+            search_text="*",
+            top=max_results,
+            select=self._all_fields(),
+        )
+        vs_list = [self._doc_to_value_stream(r) for r in results]
+        logger.info("list_all() fetched %d Value Streams from index", len(vs_list))
+        return vs_list
+
     def get_by_id(self, value_stream_id: str) -> ValueStream | None:
         """Fetch a single Value Stream by its ID."""
         try:

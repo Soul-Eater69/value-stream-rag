@@ -17,6 +17,7 @@ from src.ranking.ranker import RankingConfig, ValueStreamRanker
 from src.search.azure_search import AzureValueStreamSearcher
 from src.search.chroma_store import ChromaVectorStore
 from src.search.retriever import HybridRetriever
+from src.search.vs_catalogue import VSCatalogue
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,21 @@ class ServiceContainer:
         )
 
     @cached_property
+    def vs_catalogue(self) -> VSCatalogue:
+        """
+        Pre-loaded Value Stream catalogue.
+
+        Calls list_all() on first access, embedding all VS descriptions once.
+        All subsequent per-request retrievals use the in-memory cosine scores.
+        """
+        catalogue = VSCatalogue(
+            azure_searcher=self.azure_searcher,
+            embedding_service=self.embedding_service,
+        )
+        catalogue.load()
+        return catalogue
+
+    @cached_property
     def chroma_store(self) -> ChromaVectorStore:
         cfg = self._settings.chroma
         cfg.persist_dir.mkdir(parents=True, exist_ok=True)
@@ -63,12 +79,10 @@ class ServiceContainer:
     def retriever(self) -> HybridRetriever:
         r = self._settings.retrieval
         return HybridRetriever(
-            azure_searcher=self.azure_searcher,
+            vs_catalogue=self.vs_catalogue,
             chroma_store=self.chroma_store,
             embedding_service=self.embedding_service,
-            top_k_vs=r.top_k_value_streams,
             top_k_hist=r.top_k_historical,
-            hybrid_alpha=r.hybrid_search_alpha,
             similarity_threshold=r.similarity_threshold,
         )
 

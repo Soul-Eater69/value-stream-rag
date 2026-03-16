@@ -2,11 +2,17 @@
 HybridRetriever: orchestrates multi-source retrieval for the recommendation pipeline.
 
 Retrieval strategy:
-  1. Generate an aggregated query from uploaded PPT chunks.
-  2. Retrieve candidate Value Streams from Azure AI Search (hybrid search).
+  1. Embed uploaded PPT chunks and mean-pool into a single query vector.
+  2. Score ALL Value Streams via in-memory cosine similarity (VSCatalogue).
   3. Retrieve similar historical idea-card chunks from ChromaDB.
-  4. Extract and boost Value Streams referenced in historical matches.
-  5. Return combined evidence for the ranking module.
+  4. Extract VS IDs from historical hits (mapped_vs_ids in metadata).
+  5. Return combined RetrievalContext for the ranking module.
+
+Design note:
+  With ~50 Value Streams, scoring all of them in memory is faster and more
+  complete than a top-K index search.  No VS can be silently dropped because
+  Azure didn't happen to return it — every VS gets a cosine score regardless
+  of whether it also appears in historical evidence.
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ logger = logging.getLogger(__name__)
 class RetrievalContext:
     """Carries all retrieval outputs to the ranking layer."""
 
-    # Value Streams from Azure AI Search
+    # All Value Streams scored against the upload (full catalogue, scored)
     vs_candidates: list[ValueStream] = field(default_factory=list)
 
     # Raw hits from ChromaDB (historical chunks)
@@ -48,26 +54,22 @@ class RetrievalContext:
 
 class HybridRetriever:
     """
-    Combines Azure AI Search (Value Streams) + ChromaDB (historical PPTs)
-    to produce a rich RetrievalContext.
+    Combines VSCatalogue (all Value Streams, in-memory cosine) + ChromaDB
+    (historical idea-card chunks) to produce a rich RetrievalContext.
     """
 
     def __init__(
         self,
-        azure_searcher,     # AzureValueStreamSearcher
-        chroma_store,       # ChromaVectorStore
-        embedding_service,  # EmbeddingService
-        top_k_vs: int = 10,
+        vs_catalogue,           # VSCatalogue — pre-loaded at startup
+        chroma_store,           # ChromaVectorStore
+        embedding_service,      # EmbeddingService
         top_k_hist: int = 20,
-        hybrid_alpha: float = 0.5,
         similarity_threshold: float = 0.6,
     ) -> None:
-        self._azure = azure_searcher
+        self._catalogue = vs_catalogue
         self._chroma = chroma_store
         self._embedder = embedding_service
-        self._top_k_vs = top_k_vs
         self._top_k_hist = top_k_hist
-        self._hybrid_alpha = hybrid_alpha
         self._threshold = similarity_threshold
 
     # ------------------------------------------------------------------
@@ -84,8 +86,8 @@ class HybridRetriever:
 
         Strategy:
           - Embed each chunk individually, then aggregate via mean-pooling.
-          - Use the aggregated embedding for Azure AI Search (Value Streams).
-          - Use per-chunk embeddings for ChromaDB (historical matches).
+          - Score ALL VSes via cosine against the aggregated embedding.
+          - Query ChromaDB per-chunk for historical matches.
         """
         ctx = RetrievalContext()
 
@@ -99,46 +101,48 @@ class HybridRetriever:
 
         # Aggregate query: mean-pool all chunk embeddings
         agg_embedding = self._mean_pool(chunk_embeddings)
-        agg_text = self._build_query_text(query_chunks)
 
-        # ── Step 1: Value Stream retrieval from Azure AI Search
-        logger.info("Running hybrid search against Azure AI Search index")
-        vs_candidates = self._azure.hybrid_search(
-            query_text=agg_text,
-            query_embedding=agg_embedding,
-            top_k=self._top_k_vs,
-            domain_filter=domain_filter,
-            alpha=self._hybrid_alpha,
+        # ── Step 1: Score all Value Streams via in-memory cosine
+        logger.info(
+            "Scoring all %d Value Streams via in-memory cosine", self._catalogue.size
         )
-        ctx.vs_candidates = vs_candidates
-        logger.info("Azure AI Search returned %d VS candidates", len(vs_candidates))
+        cosine_scores = self._catalogue.score_all(agg_embedding)
 
-        # Populate evidence from VS hits
-        for vs in vs_candidates:
-            ctx.evidence[vs.id].append(
+        vs_candidates: list[ValueStream] = []
+        for vs_id, score in cosine_scores.items():
+            vs = self._catalogue.all()[vs_id]
+            if domain_filter and vs.domain and vs.domain != domain_filter:
+                continue
+            # Use model_copy to avoid mutating the shared catalogue object
+            scored_vs = vs.model_copy()
+            scored_vs.similarity_score = round(score, 4)
+            vs_candidates.append(scored_vs)
+            ctx.evidence[vs_id].append(
                 RetrievalEvidence(
-                    chunk_id=f"vs_{vs.id}",
+                    chunk_id=f"vs_{vs_id}",
                     chunk_content=vs.description,
                     chunk_type=ChunkType.SLIDE_TEXT,
                     slide_index=-1,
                     slide_title="Value Stream Definition",
-                    source_document_id=vs.id,
-                    source_document_path="azure_ai_search",
+                    source_document_id=vs_id,
+                    source_document_path="vs_catalogue",
                     evidence_source=EvidenceSource.VALUE_STREAM_INDEX,
-                    similarity_score=vs.similarity_score or 0.0,
-                    rerank_score=vs.rerank_score,
+                    similarity_score=score,
                 )
             )
+
+        ctx.vs_candidates = vs_candidates
+        logger.info("Catalogue scoring produced %d VS candidates", len(vs_candidates))
 
         # ── Step 2: Historical PPT retrieval from ChromaDB
         logger.info("Running vector search against historical PPT index (ChromaDB)")
         all_hist_hits: list[dict] = []
+        per_chunk_k = max(1, self._top_k_hist // len(query_chunks))
         for chunk, embedding in zip(query_chunks, chunk_embeddings):
             hits = self._chroma.query(
                 query_embedding=embedding,
-                top_k=self._top_k_hist // max(len(query_chunks), 1),
+                top_k=per_chunk_k,
             )
-            # Filter by threshold
             hits = [h for h in hits if h["similarity"] >= self._threshold]
             for hit in hits:
                 hit["_query_chunk_id"] = str(chunk.id)
@@ -190,7 +194,6 @@ class HybridRetriever:
     @staticmethod
     def _build_query_text(chunks: list[Chunk]) -> str:
         """Build a condensed text query from chunk titles and content."""
-        # Prioritise titles and short text chunks; limit total length
         parts: list[str] = []
         seen_titles: set[str] = set()
         for c in chunks:
@@ -199,4 +202,4 @@ class HybridRetriever:
                 seen_titles.add(c.slide_title)
             if c.chunk_type == ChunkType.SLIDE_TEXT and len(c.content) < 300:
                 parts.append(c.content)
-        return " ".join(parts)[:2000]  # Truncate to safe BM25 length
+        return " ".join(parts)[:2000]
