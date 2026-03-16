@@ -67,7 +67,7 @@
 
 ### What the System Does
 
-The Value Stream RAG system accepts an uploaded PowerPoint idea-card and recommends the most relevant Value Streams from a catalogue of ~50, ranked by semantic relevance, historical precedent, and stage-level keyword alignment.
+The Value Stream RAG system accepts an uploaded PowerPoint idea-card and recommends the most relevant Value Streams from a catalogue of ~50, ranked by cosine similarity against VS descriptions, historical precedent from similar idea-cards, and stage-level embedding similarity.
 
 ### End-to-End Pipeline
 
@@ -75,49 +75,49 @@ The Value Stream RAG system accepts an uploaded PowerPoint idea-card and recomme
 User uploads PPTX
         │
         ▼
-  Parse PPT (MarkItDown)
-  ─ Extract text per slide
-  ─ Detect and parse tables
-  ─ Annotate sections
+  Validate (extension, magic bytes, size)
+        │
+        ▼
+  Parse PPT (MarkItDown) + Long-Doc Gate
+  ─ slide_count > 40 → trim to title/summary chunks only
         │
         ▼
   Chunk Document (Hybrid Hierarchical)
-  ─ Title chunks (slide titles)
-  ─ Text sub-chunks (paragraphs)
-  ─ Table chunks (atomic, never split)
+  ─ Title, text, table, notes, doc-summary chunks
         │
         ▼
   Embed Chunks (Azure OpenAI text-embedding-3-large)
+  → mean-pool all chunk embeddings → agg_embedding
         │
-        ├──────────────────────────────────────┐
-        │                                      │
-        ▼                                      ▼
-  Azure AI Search                       ChromaDB
-  (Value Stream Index)            (Historical PPT Index)
-  ─ Hybrid search (BM25 + vector)  ─ Vector search
-  ─ Semantic reranking             ─ Returns chunks with
-  ─ Returns top-K VS candidates      mapped VS IDs
-        │                                      │
+        ├──────────────────────────────────────────────┐
+        │                                              │
+        ▼                                              ▼
+  VSCatalogue (loaded at startup)             ChromaDB
+  cosine(agg_embedding, each of ~50 VS embs)  Per-chunk vector search
+  → score for EVERY VS, nothing dropped        (skipped in long-doc mode)
+        │                                      → historical hits with
+        │                                        mapped_vs_ids metadata
         └──────────────────────────────────────┘
                           │
                           ▼
-                  Rank & Score
-                  ─ VS similarity score
-                  ─ Historical boost score
-                  ─ Stage keyword overlap
-                  ─ Rerank score
+                  Rank & Score (all ~50 VSes)
+                  ─ 0.40 × cosine similarity (VS description)
+                  ─ 0.35 × historical boost (from mapped_vs_ids)
+                  ─ 0.15 × rerank score (Azure semantic, optional)
+                  ─ 0.10 × stage embedding similarity
                           │
                           ▼
               LLM Reasoning (GPT-4o)
+              ─ Sanitise slide content (prompt injection guard)
               ─ Summarise uploaded PPT
               ─ Generate explanation
                           │
                           ▼
               Recommendation Result
-              ─ Ranked Value Streams
+              ─ Top-5 Ranked Value Streams
               ─ Evidence per VS
               ─ Natural language reasoning
-              ─ Confidence score
+              ─ Confidence score (heuristic; calibrate via ConfidenceCalibrator)
 ```
 
 ---
@@ -476,11 +476,12 @@ sequenceDiagram
     G->>L: summarise_ppt(state)
     L-->>G: query_summary (2-3 sentences)
 
+    G->>G: apply_long_doc_gate (trim chunks if slide_count > 40)
     G->>R: retrieve_candidates(state)
-    R->>R: Mean-pool chunk embeddings
-    R->>AzureSearch: hybrid_search(agg_embedding, query_text)
-    R->>ChromaDB: query(per-chunk embeddings)
-    R-->>G: RetrievalContext (VS candidates + historical hits)
+    R->>R: Mean-pool chunk embeddings → agg_embedding
+    R->>VSCatalogue: score_all(agg_embedding) → cosine score for ALL ~50 VSes
+    R->>ChromaDB: per-chunk query for historical hits (skipped if long_doc_mode=True)
+    R-->>G: RetrievalContext (all VSes scored + historical hits with mapped_vs_ids)
 
     G->>G: rank_candidates(state)
 
@@ -501,113 +502,201 @@ sequenceDiagram
 
 **Chosen approach:** In-memory. Chunks from uploaded PPTs are embedded and used directly for retrieval queries, but never written to ChromaDB or Azure AI Search.
 
+**Long-document degradation:** For decks above 40 slides (configurable via `LONG_DOC_SLIDE_THRESHOLD`), the `apply_long_doc_gate` node trims `query_chunks` to title and synthetic-summary chunks only before embedding. This prevents mean-pooling dilution from dozens of unrelated slide chunks. Per-chunk ChromaDB search is also skipped in this mode. See §7 Long-Document Gate for detail.
+
 ---
 
 ## 7. Retrieval and Recommendation Strategy
 
-### Multi-Step Retrieval Strategy
+### Canonical Algorithm
 
-```mermaid
-graph LR
-    Q["Uploaded PPT Chunks + Doc Summary"]
-    Q --> QE["LLM Query Expansion — GPT-4o — domain + problem type + outcomes"]
-    QE --> AGG["Mean-pool embeddings — Build structured query text"]
-
-    subgraph Source1["Source 1 — Azure AI Search"]
-        AGG --> HYB["Hybrid Search — BM25 + Vector + RRF"]
-        HYB --> SEM["Semantic Reranking — Azure native ranker"]
-        SEM --> VS_CAND["Top-K Value Stream Candidates with scores"]
-    end
-
-    subgraph Source2["Source 2 — ChromaDB"]
-        Q --> PER_CHUNK["Per-chunk vector search"]
-        PER_CHUNK --> HIST_HITS["Historical PPT chunks with mapped VS IDs"]
-    end
-
-    VS_CAND --> RANK["Weighted Scorer + Diversity Penalty"]
-    HIST_HITS --> HIST_BOOST["Historical Boost — time-decayed — computed per VS"]
-    HIST_BOOST --> RANK
-
-    VS_CAND --> STAGE["Stage Soft Match — embedding similarity vs stage descriptions"]
-    STAGE --> RANK
-
-    RANK --> TOP_N["Top-N Ranked Value Streams"]
-    TOP_N --> LLM["GPT-4o Reasoning"]
-    LLM --> REC["Recommendation Result"]
-```
-
-### Pre-Retrieval: LLM Query Expansion
-
-Before retrieval, a **`query_expand` node** reads the parsed slides and doc summary and asks GPT-4o to produce a structured query:
+**Single authoritative spec. All implementation must match this exactly.**
 
 ```
-Prompt: "Given the following idea card content, identify:
-1. The primary business domain (e.g. Supply Chain, Finance, HR)
-2. The core problem type (e.g. process automation, cost reduction, compliance)
-3. The expected business outcomes (e.g. 20% FTE reduction, SLA improvement)
-4. Any explicit Value Stream or capability keywords mentioned.
-Output as JSON."
+RECOMMEND(uploaded_ppt):
+
+  ── PHASE 0: LONG-DOCUMENT GATE ──────────────────────────────────────
+  slide_count = len(uploaded_ppt.slides)
+
+  if slide_count > 40:
+      query_chunks = [c for c in all_chunks
+                      if c.type in {SLIDE_TITLE, SYNTHETIC_SUMMARY}]
+      if not query_chunks:
+          # fallback: one chunk per unique slide, up to 40
+          query_chunks = first_chunk_per_slide(all_chunks)[:40]
+      long_doc_mode = True
+  else:
+      query_chunks = all_chunks
+      long_doc_mode = False
+
+  ── PHASE 1: EMBED ───────────────────────────────────────────────────
+  for each chunk c in query_chunks:
+      chunk_embeddings[c.id] = EMBED(c.enriched_content or c.content)
+      #   ↑ per-chunk; used individually for ChromaDB in Phase 3
+
+  agg_embedding = MEAN_POOL(chunk_embeddings.values())
+      #   ↑ single vector; used for VS scoring in Phase 2
+
+  ── PHASE 2: EXHAUSTIVE VS SCORING ───────────────────────────────────
+  # Score ALL ~50 VSes. Nothing is dropped. No top-K cutoff.
+  # This is also the standalone ExhaustiveBaselineRetriever path.
+  for each vs in CATALOGUE.all():     # loaded from Azure once at startup
+      vs_scores[vs.id] = COSINE(agg_embedding, CATALOGUE.embedding[vs.id])
+      # domain_filter applied post-loop if provided
+
+  ── PHASE 3: HISTORICAL EVIDENCE ─────────────────────────────────────
+  # Per-chunk ChromaDB search for historical idea-cards mapped to VSes.
+  # Both historical PPTs and idea-cards carry mapped_vs_ids in metadata.
+  # Skipped in long-doc mode (trimmed title chunks are too sparse).
+  if long_doc_mode:
+      hist_boost = {}
+  else:
+      per_chunk_k = max(1, TOP_K_HIST // len(query_chunks))  # e.g. 20 // N
+
+      for each (chunk_c, emb_c) in zip(query_chunks, chunk_embeddings):
+          hits = CHROMA_QUERY(emb_c, top_k=per_chunk_k)
+          hits = [h for h in hits if h.similarity >= THRESHOLD]  # e.g. 0.6
+
+          for hit in hits:
+              for vs_id in hit.metadata["mapped_vs_ids"]:   # JSON list
+                  hist_sim_sum[vs_id] += hit.similarity
+                  hist_count[vs_id]   += 1
+
+      for vs_id in hist_sim_sum:
+          hist_boost[vs_id] = min(1.0,
+              (hist_sim_sum[vs_id] / hist_count[vs_id])
+              * (1 + 0.1 * log1p(hist_count[vs_id])))
+
+  ── PHASE 4: STAGE KEYWORD OVERLAP ───────────────────────────────────
+  # Lexical string matching — NOT embedding cosine.
+  # Contributes 0.10 weight; rewards VS-specific terminology in the deck.
+  query_text = join(c.content[:200] for c in query_chunks[:10])
+
+  for each vs in CATALOGUE.all():
+      stage_keywords = flatten(
+          stage.keywords + [stage.name]
+          for stage in vs.stage_sequence.stages
+      )
+      if stage_keywords:
+          matched = count(kw for kw in stage_keywords
+                          if kw.lower() in query_text.lower())
+          stage_scores[vs.id] = min(1.0, matched / len(stage_keywords))
+      else:
+          stage_scores[vs.id] = 0.0
+
+  ── PHASE 5: FINAL SCORING ───────────────────────────────────────────
+  for each vs_id in ALL_VS_IDS:    # = CATALOGUE.all().keys()
+      rerank = vs.rerank_score if vs.rerank_score is not None
+               else vs_scores[vs_id]    # falls back to cosine
+
+      final_score[vs_id] = (
+          0.40 * vs_scores.get(vs_id, 0.0)     # cosine: upload vs VS description
+        + 0.35 * hist_boost.get(vs_id, 0.0)    # historical: similar cards mapped here
+        + 0.15 * rerank                          # Azure semantic reranker (V2, optional)
+        + 0.10 * stage_scores.get(vs_id, 0.0)  # lexical keyword overlap (NOT cosine)
+      )
+
+  return TOP_5(final_score, descending=True)
+
+  ── PHASE 6: LLM SYNTHESIS ───────────────────────────────────────────
+  for each chunk in query_chunks:
+      safe_content = SANITISE(chunk.content)   # strip control chars, redact injection
+  summary   = LLM_SUMMARISE(safe_content)      # 3s timeout; fallback to slide titles
+  reasoning = LLM_EXPLAIN(summary, top_5_vs)
+  confidence = HEURISTIC(top_score, score_gap) # uncalibrated; see §7 Confidence below
 ```
 
-This structured output replaces or augments raw slide text as the retrieval query, giving both the BM25 and vector retrievers much higher-quality input than mean-pooled noise-heavy slide embeddings.
+**Terminology disambiguation** — used consistently throughout this document:
+
+| Term | Meaning | Phase |
+|------|---------|-------|
+| Embedding similarity / cosine | `dot(a,b)/(‖a‖‖b‖)` on two embedding vectors | 2, 4 (stage V2) |
+| Keyword overlap | `str.lower() in query_text.lower()` — string match, not cosine | 4 |
+| Mean-pool | Average of all chunk embedding vectors into one query vector | 1 |
+| Per-chunk | Each chunk's individual embedding used directly | 3 |
+| Historical boost | Aggregated cosine of historically similar idea-cards mapped to a VS | 3 |
+
+---
+
+### Exhaustive Baseline
+
+Before optimising, validate that the exhaustive cosine baseline meets targets.
+
+**Baseline algorithm:** run only Phase 0–2 above. Skip historical (Phase 3), stage scores (Phase 4), and reranking. Return TOP_5 by `vs_scores` alone.
+
+This is implemented as `ExhaustiveBaselineRetriever` (`src/search/baseline.py`). Run it in offline eval against the same hold-out set as the full pipeline. If baseline Hit@3 > 0.70, the additional complexity of Phases 3–4 is not earning its keep for V1 and should be deferred.
+
+**Why this works:** ~50 VS descriptions are distinct enough that a well-formed doc-summary embedding usually lands nearest the correct VS in cosine space. The historical and stage signals become meaningful only when two VSes have similar descriptions.
+
+---
+
+### Pre-Retrieval: Query Expansion
+
+The `expand_query` node (`src/graph/nodes/expansion_nodes.py`) produces a structured dict before retrieval. Its contract is strict:
+
+**Output schema (JSON, validated before use):**
+```json
+{
+  "summary":     "string, max 400 chars, required",
+  "keywords":    ["array", "of", "strings", "5-15 items", "required"],
+  "domain_hint": "string or null, optional"
+}
+```
+
+**Hardening:**
+- **Timeout:** 3-second hard limit on the LLM call via `concurrent.futures.ThreadPoolExecutor`. On timeout the future is cancelled; pipeline continues with the fallback.
+- **Bypass rule:** Skip LLM entirely if `slide_count ≤ 8` AND `total_content_chars ≤ 1500`. Short decks don't need expansion — their content is already low-noise.
+- **Deterministic fallback** (used on bypass, timeout, or JSON parse error):
+  1. Summary = unique slide titles joined with `;`, up to 5 titles
+  2. Keywords = top-15 terms by word frequency in slide content, stop-words removed
+  3. `domain_hint` = `null`
+- **Schema validation:** required fields checked by type; malformed LLM output triggers the fallback, not a pipeline error.
+
+---
 
 ### Evidence Combination
 
-| Signal | Weight | Description |
-|--------|--------|-------------|
-| `vs_similarity_score` | 0.40 | Azure AI Search hybrid score for direct VS match |
-| `historical_boost_score` | 0.35 | Time-decayed similarity of historical chunks referencing this VS |
-| `rerank_score` | 0.15 | Azure semantic ranker or cross-encoder score |
-| `stage_match_score` | 0.10 | **Soft match**: embedding similarity between PPT content and VS stage descriptions |
+| Signal | Weight | Source | What it measures |
+|--------|--------|--------|-----------------|
+| `vs_similarity_score` | 0.40 | Phase 2 cosine (all 50 VSes) | Semantic match of upload to VS description |
+| `historical_boost_score` | 0.35 | Phase 3 ChromaDB `mapped_vs_ids` | How many similar historical cards used this VS |
+| `rerank_score` | 0.15 | Azure semantic reranker (V2, optional) | Cross-encoder re-score; falls back to cosine |
+| `stage_match_score` | 0.10 | Phase 4 lexical keyword overlap | VS-specific terminology present in upload |
 
-**Weights are configurable** in `RankingConfig` and are candidates for learned optimisation once feedback data is available (see Decision 5 and Section 17).
+**Weights are configurable** in `RankingConfig`. Treat current values as initial estimates pending offline eval results.
+
+---
 
 ### Historical Boost Calculation
 
 ```python
-# Time-decay factor: recent mappings weighted higher
-DECAY_HALFLIFE_DAYS = 180
-decay = 0.5 ** ((now - mapping.created_at).days / DECAY_HALFLIFE_DAYS)
-
-boost[vs_id] = min(1.0, (mean_similarity * decay) * (1 + 0.1 * log(hit_count + 1)))
+boost[vs_id] = min(1.0,
+    (hist_sim_sum[vs_id] / hist_count[vs_id])
+    * (1 + 0.1 * log1p(hist_count[vs_id])))
 ```
 
-This formula rewards:
-- High average semantic similarity between the uploaded PPT and historical cards mapped to this VS.
-- Consensus: if many historical cards agree (high `hit_count`), the boost increases logarithmically.
-- **Recency:** mappings older than ~6 months decay toward zero, preventing the system from entrenching early biases or over-rewarding historically popular Value Streams.
+Rewards: high mean similarity AND consensus across multiple historical cards. No time-decay is applied in V1 (the catalogue is stable; decay is a V2 item once feedback data accrues).
 
-### Stage Soft Matching
+---
 
-Instead of lexical keyword overlap, stage matching now uses **embedding similarity**:
+### Long-Document Gate
 
-```python
-stage_match_score[vs_id] = cosine_similarity(
-    mean(chunk_embeddings),
-    mean(embed(stage.description) for stage in vs.stages)
-)
-```
+Implemented in `apply_long_doc_gate` (`src/graph/nodes/parse_nodes.py`):
 
-This avoids false positives from domain-ambiguous terms (e.g. "Discovery" in pharma vs. software contexts) and false negatives from synonym variation. VS stage descriptions are pre-embedded and cached at startup.
+| Slide count | Behaviour |
+|-------------|-----------|
+| ≤ 40 | Normal path: all chunks embedded, ChromaDB per-chunk search runs |
+| > 40 | Gate trims `query_chunks` to `SLIDE_TITLE` + `SYNTHETIC_SUMMARY` only. Sets `long_doc_mode=True`. ChromaDB per-chunk search is skipped (Phase 3). Only VS cosine scoring (Phase 2) runs. |
 
-### Diversity Penalty
+Threshold of 40 is the initial value. Validate against your actual PPT distribution in offline eval — if mean deck length is 25 slides, lower it to 30.
 
-To prevent the ranked list collapsing onto 5–6 dominant Value Streams:
+---
 
-```python
-# Penalise VS if a closely related VS is already ranked above it
-diversity_penalty[vs_id] = max(
-    cosine_similarity(embed(vs), embed(already_ranked_vs))
-    for already_ranked_vs in ranked_above
-)
-final_score[vs_id] = raw_score[vs_id] * (1 - 0.3 * diversity_penalty[vs_id])
-```
+### Confidence Score
 
-The penalty factor (0.3) is configurable in `RankingConfig`. This ensures the long tail of ~50 Value Streams is surfaced when relevant.
+> ⚠️ **The current confidence score is a heuristic, not a calibrated probability.**
 
-### Confidence Thresholding
-
-The `confidence_score` returned in the API response is calibrated, not just a rescaled similarity:
+Current formula: `confidence = top_score × (1 + score_gap)` where `score_gap` is the difference between rank-1 and rank-2 final scores.
 
 | Confidence Tier | Score Range | Response behaviour |
 |----------------|-------------|-------------------|
@@ -615,7 +704,7 @@ The `confidence_score` returned in the API response is calibrated, not just a re
 | **Medium** | 0.50 – 0.74 | Return top 3 with a caveat note |
 | **Low** | < 0.50 | Return `"no_strong_match"` signal; still provide best-effort candidates |
 
-This prevents users from over-trusting marginal results.
+**These thresholds are initial guesses and must be validated.** Use `ConfidenceCalibrator.approval_rate_by_band()` after running offline eval to check whether the 0.75 / 0.50 splits actually separate correct from incorrect results. If approval rate is flat across bands, the score is not calibrated and the tiers are misleading. Calibration is a V2 item once labelled feedback data is available.
 
 ---
 
@@ -1121,7 +1210,7 @@ graph LR
 | **Chosen** | Uploaded PPT chunks are held in memory for the duration of one request |
 | **Why** | No contamination of the historical index. Simplest implementation. Adequate for PPTs with 10–50 slides. |
 | **Alternative** | Index uploaded PPT temporarily then delete |
-| **Tradeoff** | Memory usage scales with PPT size. For very large PPTs (100+ slides), batch embedding may be needed. |
+| **Tradeoff** | Memory usage scales with PPT size. The long-document gate (`LONG_DOC_SLIDE_THRESHOLD = 40`) handles large decks by trimming to title/summary chunks before embedding. |
 | **When to switch** | If multi-turn interaction is needed (e.g., user refines their query), persist the upload temporarily. |
 
 ### Decision 5: Weighted Score Combination (with feedback-driven tuning path)
